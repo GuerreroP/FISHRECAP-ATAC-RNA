@@ -1,0 +1,178 @@
+---
+title: "Genome-wide chromatin accessibility and gene expression profiling during flatfish metamorphosis"
+output:
+  pdf_document: default
+  html_document: default
+date: "2023-02-19"
+---
+# Data normalization and filtering with DESeq2 package
+
+### Load libraries
+
+```{r, message=FALSE, warning=FALSE}
+library(BiocManager)
+library(DESeq2)
+library(ggplot2)
+```
+
+### Load input data 
+
+Load input data from GEO dataset. Creating a dataframe.
+
+```{r, message=FALSE, warning=FALSE}
+urlGEO <- "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE215395&format=file"
+newDir <- tempdir()
+newTempFile <- paste0(newDir,  "/GSE215395_RAW.tar")
+download.file(urlGEO, newTempFile)
+untar(newTempFile, exdir = newDir )
+files <- untar(newTempFile, list = TRUE)
+library(readr)
+read_file <- function(filePath){
+  read_delim(filePath, 
+    delim = "\t", escape_double = FALSE, 
+    col_names = FALSE, trim_ws = TRUE, show_col_types = FALSE)
+}
+
+data <- lapply(paste0(newDir,"/", files), read_file)
+mergedData <- data[[1]]
+for(i in 2:length(files)) {
+  mergedData <- cbind(mergedData, data[[i]][2])
+}
+mergedData$X1 <- gsub("gene:", "", mergedData$X1)
+mergedData <- tibble::column_to_rownames(mergedData, "X1")
+```
+
+From the counts matrix, the necessary data structure is constructed taking into account the different conditions.
+
+```{r, message=FALSE, warning=FALSE}
+treatments = DataFrame(condition=factor(c('phylo', 'phylo','premet', 'premet', 'climax', 'climax', 'postmet', 'postmet')))
+dds = DESeqDataSetFromMatrix(mergedData, treatments, formula(~condition))
+```
+
+### Pre-filtering
+
+Rows with very low readings are removed to increase the speed of the transformation and testing functions within DESeq2. Rows with less than or equal to 10 reads in at least 8 samples will be removed. 
+
+```{r, message=FALSE, warning=FALSE}
+filter = rowSums(counts(dds)>=10)>=8
+ddsCountFlt = dds[filter,]
+```
+
+### Normalization with DESeq2
+
+Counts from the htseq software and pre-filtered are normalized in order to minimize the noise introduced by the sequencing process. 
+
+```{r, message=FALSE, warning=FALSE}
+ddsCountFlt = DESeq(ddsCountFlt)
+normCounts = counts(ddsCountFlt, normalized = TRUE)
+```
+
+# Soft-clustering with Mfuzz package
+
+### Load libraries
+
+```{r, message=FALSE, warning=FALSE}
+library(Mfuzz)
+library("Biobase")
+```
+
+### Preprocessing normcounts 
+
+```{r, message=FALSE, warning=FALSE}
+means <- data.frame(matrix(nrow = nrow(normCounts), ncol = 0))
+means$phylo <- rowMeans(normCounts[,1:2])
+means$premet <- rowMeans(normCounts[,3:4])
+means$climax <- rowMeans(normCounts[,5:6])
+means$postmet <- rowMeans(normCounts[,7:8])
+rownames(means) <- rownames(normCounts)
+```
+
+Genes with more than 50% of the measurements missing and those with small changes in expression will be excluded. 
+
+```{r, message=FALSE, warning=FALSE}
+mfuzz<-as.matrix(means)
+mfuzz<-log(mfuzz+1)
+minimalSet <- ExpressionSet(assayData=mfuzz)
+filteredSet <- filter.NA(minimalSet, thres=0.5)
+filledSet <- fill.NA(filteredSet)
+tmp <- filter.std(filledSet, min.std=0)
+```
+
+Expression value of genes will be estandarised to ensure that similar changes in expression are close in Euclidean space for clustering.
+
+```{r, message=FALSE, warning=FALSE}
+standardisedSet <- standardise(filledSet)
+```
+
+### Calculation of fuzzifier m and number of clusters
+
+```{r, message=FALSE, warning=FALSE}
+m1 <- mestimate(standardisedSet)
+```
+
+Selection of optimal number of clusters with the aim of avoiding overlapping.
+
+```{r, message=FALSE, warning=FALSE}
+tmp3 <- cselection(standardisedSet, m=m1, crange=seq(2,40,2), repeats=5, visu=TRUE)
+tmp_4  <- Dmin(standardisedSet,m=m1,crange=seq(10,40,10),repeats=30,visu=TRUE)
+tmp_4  <- Dmin(standardisedSet,m=m1,crange=seq(5,40,5),repeats=30,visu=TRUE)
+```
+
+Number of clusters determined based on the above results.
+
+```{r, message=FALSE, warning=FALSE}
+ncluster <- 30
+```
+
+Clustering generation.
+```{r, message=FALSE, warning=FALSE}
+cl <- mfuzz(standardisedSet,c=ncluster,m=m1)
+mfuzz.plot(standardisedSet,cl=cl,mfrow=c(4,5), new.window = FALSE)
+```
+
+Select the clusters of interest and extract the genes belonging to those clusters. The genes belonging to the selected clusters will be used as input for GOs enrichment analysis. For the sake of completeness of the example, some clusters have been selected at random.
+
+```{r, message=FALSE, warning=FALSE}
+selected_clusters <- cl$cluster[cl$cluster %in% c(4,10,25)]
+```
+
+
+# GOs enrichment analysis with Clusterprofiler package
+
+### Load libraries
+
+```{r, message=FALSE, warning=FALSE}
+library(clusterProfiler)
+library(ggplot2)
+library(RColorBrewer)
+library(enrichplot)
+```
+
+### Load functional annotation
+```{r, message=FALSE, warning=FALSE, eval=FALSE}
+TERM2GENE_BP <- read.csv("https://github.com/GuerreroP/FISHRECAP-ATAC-RNA/raw/3946e648fc81aa589113ad6d86485170d6311acd/TERM2GENE_BP.csv", sep=";")
+TERM2NAME_BP <- read.csv("https://github.com/GuerreroP/FISHRECAP-ATAC-RNA/raw/3946e648fc81aa589113ad6d86485170d6311acd/TERM2NAME_BP.csv", sep=";")
+```
+
+### Gene ontology enrichment
+```{r, message=FALSE, warning=FALSE, eval=FALSE}
+result <- enricher(
+  gene$X,
+  pvalueCutoff = 5,
+  pAdjustMethod = "BH",
+  minGSSize = 10,
+  maxGSSize = 500,
+  qvalueCutoff = 5,
+  TERM2GENE=TERM2GENE_BP,
+  TERM2NAME=TERM2NAME_BP
+)
+```
+
+### Plot result
+```{r, message=FALSE, warning=FALSE, eval=FALSE}
+plot <- barplot(result, title="GO (BP)", showCategory=10, x="GeneRatio", font.size = 12) 
+plot +
+  theme(
+    panel.grid = element_blank()
+  ) + scale_color_brewer(palette = "Blues")
+```
